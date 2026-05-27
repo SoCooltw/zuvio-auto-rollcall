@@ -35,6 +35,26 @@ function Run-Python {
     }
 }
 
+function Test-PythonModule {
+    param(
+        [hashtable]$Python,
+        [string]$ModuleName
+    )
+
+    Run-Python -Python $Python -PythonArgs @("-c", "import $ModuleName")
+    return $LASTEXITCODE -eq 0
+}
+
+function Install-Dependencies {
+    $installerPath = Join-Path $PSScriptRoot "install_dependencies.ps1"
+    if (-not (Test-Path -LiteralPath $installerPath)) {
+        return $false
+    }
+
+    & $installerPath
+    return $LASTEXITCODE -eq 0
+}
+
 function Read-Required {
     param([string]$Prompt)
 
@@ -62,8 +82,25 @@ $scriptPath = Join-Path $PSScriptRoot "zuvio_interactive.py"
 $python = Find-Python
 
 if ($null -eq $python) {
-    Write-Host "Cannot start. Please contact the person who shared this tool."
-    exit 1
+    Write-Host ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("5om+5LiN5Yiw5ZWf5YuV55Kw5aKD77yM6KuL5YWI5Z+36KGM44CM56ys5LiA5qyh5L2/55SoLeWuieijneWll+S7ti5iYXTjgI3jgII=")))
+    if (-not (Install-Dependencies)) {
+        exit 1
+    }
+    $python = Find-Python
+    if ($null -eq $python) {
+        exit 1
+    }
+}
+
+if (-not (Test-PythonModule -Python $python -ModuleName "requests")) {
+    Write-Host ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("57y65bCR5b+F6KaB5aWX5Lu277yM5q2j5Zyo5YWI5Z+36KGM5a6J6KOdLi4u")))
+    if (-not (Install-Dependencies)) {
+        exit 1
+    }
+    $python = Find-Python
+    if (($null -eq $python) -or (-not (Test-PythonModule -Python $python -ModuleName "requests"))) {
+        exit 1
+    }
 }
 
 Run-Python -Python $python -PythonArgs @($scriptPath)
