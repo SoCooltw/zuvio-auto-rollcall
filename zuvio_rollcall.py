@@ -12,11 +12,13 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import hashlib
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 try:
@@ -30,6 +32,7 @@ LOGIN_URL = f"{BASE_URL}/irs/submitLogin"
 HOME_URL = f"{BASE_URL}/"
 COURSE_LIST_URL = f"{BASE_URL}/course/listStudentCurrentCourses"
 MAKE_ROLLCALL_URL = f"{BASE_URL}/app_v2/makeRollcall"
+DEBUG_DIR = Path(__file__).resolve().with_name("debug_logs")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -61,6 +64,14 @@ class PollResult:
     status: str
     rollcall_id: str | None = None
     message: str | None = None
+
+
+@dataclass
+class RollcallPage:
+    rollcall_id: str | None
+    status_code: int
+    url: str
+    html: str
 
 
 def fixed_text(resp: requests.Response) -> str:
@@ -216,19 +227,83 @@ def find_course_id(courses: list[dict[str, Any]], keyword: str) -> tuple[str, di
 
 
 def extract_rollcall_id(html: str) -> str | None:
-    match = re.search(r"var\s+rollcall_id\s*=\s*['\"]([^'\"]*)['\"]", html)
+    match = re.search(
+        r"var\s+rollcall_id\s*=\s*(?:['\"]([^'\"]*)['\"]|([^;\s]+))",
+        html,
+    )
     if not match:
         return None
 
-    rollcall_id = match.group(1).strip()
+    rollcall_id = (match.group(1) or match.group(2) or "").strip()
+    if rollcall_id.lower() in {"null", "undefined"}:
+        return None
     return rollcall_id or None
 
 
-def fetch_rollcall_id(session: requests.Session, course_id: str) -> str | None:
+def fetch_rollcall_page(session: requests.Session, course_id: str) -> RollcallPage:
     url = f"{BASE_URL}/student5/irs/rollcall/{course_id}"
     resp = session.get(url, headers={"Referer": HOME_URL}, timeout=20)
     resp.raise_for_status()
-    return extract_rollcall_id(fixed_text(resp))
+    html = fixed_text(resp)
+    return RollcallPage(
+        rollcall_id=extract_rollcall_id(html),
+        status_code=resp.status_code,
+        url=resp.url,
+        html=html,
+    )
+
+
+def fetch_rollcall_id(session: requests.Session, course_id: str) -> str | None:
+    return fetch_rollcall_page(session, course_id).rollcall_id
+
+
+def page_fingerprint(html: str) -> str:
+    return hashlib.sha256(html.encode("utf-8", "ignore")).hexdigest()
+
+
+def redact_debug_html(html: str) -> str:
+    redacted = re.sub(
+        r"(accessToken\s*=\s*['\"])[^'\"]+",
+        r"\1[redacted]",
+        html,
+        flags=re.IGNORECASE,
+    )
+    redacted = re.sub(
+        r"([?&]accessToken=)[^&\"'<>]+",
+        r"\1[redacted]",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    redacted = re.sub(
+        r"(user_id\s*=\s*['\"]?)[^'\";\s]+",
+        r"\1[redacted]",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    return redacted
+
+
+def page_text_summary(html: str, max_length: int = 320) -> str:
+    text = re.sub(r"<(script|style)\b.*?</\1>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_length] or "(頁面沒有可讀文字)"
+
+
+def save_debug_snapshot(course_id: str, page: RollcallPage) -> Path:
+    DEBUG_DIR.mkdir(exist_ok=True)
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_course_id = re.sub(r"[^0-9A-Za-z_-]+", "_", course_id)[:80] or "unknown"
+    path = DEBUG_DIR / f"rollcall_{safe_course_id}_{timestamp}.html"
+    header = (
+        "<!--\n"
+        f"debug_time: {dt.datetime.now().isoformat(timespec='seconds')}\n"
+        f"status_code: {page.status_code}\n"
+        f"url: {page.url}\n"
+        "-->\n"
+    )
+    path.write_text(header + redact_debug_html(page.html), encoding="utf-8")
+    return path
 
 
 def validate_gps(lat: str | None, lng: str | None) -> tuple[str, str]:
@@ -343,6 +418,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="After handling one rollcall, keep watching for later rollcalls.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print diagnostics and save rollcall page snapshots when no rollcall_id is found.",
+    )
     parser.add_argument("--lat", help="Optional latitude, only send when both lat/lng are valid")
     parser.add_argument("--lng", help="Optional longitude, only send when both lat/lng are valid")
     return parser
@@ -402,10 +482,12 @@ def main() -> int:
             )
 
         last_status = "尚未檢查"
+        last_debug_fingerprint: str | None = None
         handled_rollcall_ids: set[str] = set()
         while True:
             try:
-                rollcall_id = fetch_rollcall_id(session, course_id)
+                page = fetch_rollcall_page(session, course_id)
+                rollcall_id = page.rollcall_id
             except requests.RequestException as exc:
                 last_status = f"讀取失敗：{exc.__class__.__name__}"
                 print(f"[{now_label()}] {last_status}")
@@ -413,6 +495,14 @@ def main() -> int:
                 if not rollcall_id:
                     last_status = "未開放"
                     print(f"[{now_label()}] 未開放")
+                    if args.debug:
+                        fingerprint = page_fingerprint(page.html)
+                        print(f"debug: HTTP {page.status_code} | {page.url}")
+                        if fingerprint != last_debug_fingerprint:
+                            snapshot_path = save_debug_snapshot(course_id, page)
+                            print(f"debug: 已保存頁面快照 {snapshot_path}")
+                            print(f"debug: 頁面文字摘要：{page_text_summary(page.html)}")
+                            last_debug_fingerprint = fingerprint
                 elif rollcall_id in handled_rollcall_ids:
                     last_status = f"已處理過這次點名，繼續等待下一次"
                     print(f"[{now_label()}] 已處理過，等待下一次點名")
